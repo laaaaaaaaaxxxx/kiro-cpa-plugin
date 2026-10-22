@@ -699,9 +699,6 @@ func usageCredentialKey(token *kiroauth.KiroTokenData, authIndex, name string) s
 		if value := strings.TrimSpace(token.ClientID); value != "" {
 			return "client:" + stableCredentialHash(value)
 		}
-		if value := strings.TrimSpace(token.ProfileArn); value != "" {
-			return "profile:" + stableCredentialHash(value)
-		}
 	}
 	if value := strings.TrimSpace(authIndex); value != "" {
 		return "auth:" + value
