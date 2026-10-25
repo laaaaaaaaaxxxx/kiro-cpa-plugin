@@ -10,8 +10,7 @@ import (
 // body to summarize it. Fourteen of them read it without a bound, so a broken or
 // hostile upstream sized an allocation inside the shared CPA process from a
 // request nobody could see. Nothing downstream needs more than the cap:
-// summarizeErrorBody truncates to 512 bytes and isThinkingSignatureInvalid only
-// searches for a marker.
+// summarizeErrorBody truncates to 512 bytes.
 func TestUpstreamErrorBodyReadIsBounded(t *testing.T) {
 	t.Parallel()
 

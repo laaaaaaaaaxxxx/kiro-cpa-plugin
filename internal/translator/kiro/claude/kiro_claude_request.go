@@ -194,6 +194,18 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, cap
 		}}
 	}
 
+	additionalFields := capability.AdditionalFieldsForRequest(effort, gjson.GetBytes(claudeBody, "max_tokens").Int())
+	thinkingFields, note := capability.ThinkingFields(gjson.GetBytes(claudeBody, "thinking.type").String(), gjson.GetBytes(claudeBody, "thinking.display").String())
+	if note != "" {
+		log.Infof("kiro: model=%s %s", modelID, note)
+	}
+	if thinkingFields != nil {
+		if additionalFields == nil {
+			additionalFields = make(map[string]any)
+		}
+		additionalFields["thinking"] = thinkingFields
+	}
+
 	payload := KiroPayload{
 		ConversationState: KiroConversationState{
 			ChatTriggerType: "MANUAL",
@@ -203,7 +215,7 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, cap
 		},
 		ProfileArn:                   profileArn,
 		AgentMode:                    kirocommon.AgentModeVibe,
-		AdditionalModelRequestFields: capability.AdditionalFieldsForRequest(effort, gjson.GetBytes(claudeBody, "max_tokens").Int()),
+		AdditionalModelRequestFields: additionalFields,
 	}
 
 	result, err := json.Marshal(payload)
@@ -484,19 +496,16 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 				})
 			}
 		} else if role == "assistant" {
-			assistantMsg := BuildAssistantMessageStruct(msg)
-			if isLastMessage {
+			for _, assistantMsg := range BuildAssistantMessages(msg) {
 				history = append(history, KiroHistoryMessage{
 					AssistantResponseMessage: &assistantMsg,
 				})
+			}
+			if isLastMessage {
 				currentUserMsg = &KiroUserInputMessage{
 					ModelID: modelID,
 					Origin:  origin,
 				}
-			} else {
-				history = append(history, KiroHistoryMessage{
-					AssistantResponseMessage: &assistantMsg,
-				})
 			}
 		}
 	}
@@ -604,14 +613,20 @@ func kiroImageFromClaudeBlock(part gjson.Result) (KiroImage, bool) {
 	return KiroImage{Format: format, Source: KiroImageSource{Bytes: data}}, true
 }
 
-// BuildAssistantMessageStruct builds an assistant message with tool uses
-func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage {
+// BuildAssistantMessages keeps independently signed or redacted blocks in
+// separate native history messages because Kiro accepts one reasoningContent per
+// message. Text and tool uses remain attached to their preceding reasoning block.
+func BuildAssistantMessages(msg gjson.Result) []KiroAssistantResponseMessage {
 	content := msg.Get("content")
+	var messages []KiroAssistantResponseMessage
+	var current KiroAssistantResponseMessage
 	var contentBuilder strings.Builder
-	var toolUses []KiroToolUse
-	var reasoningText strings.Builder
-	var reasoningSignature string
-	var redactedContent string
+	flush := func() {
+		current.Content = contentBuilder.String()
+		messages = append(messages, current)
+		current = KiroAssistantResponseMessage{}
+		contentBuilder.Reset()
+	}
 
 	if content.IsArray() {
 		for _, part := range content.Array() {
@@ -620,13 +635,23 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 			case "text":
 				contentBuilder.WriteString(part.Get("text").String())
 			case "thinking":
-				reasoningText.WriteString(part.Get("thinking").String())
 				if signature := part.Get("signature").String(); signature != "" {
-					reasoningSignature = signature
+					if current.ReasoningContent != nil {
+						flush()
+					}
+					current.ReasoningContent = &KiroReasoningContent{
+						ReasoningText: &KiroReasoningText{
+							Text:      part.Get("thinking").String(),
+							Signature: signature,
+						},
+					}
 				}
 			case "redacted_thinking":
 				if data := part.Get("data").String(); data != "" {
-					redactedContent = data
+					if current.ReasoningContent != nil {
+						flush()
+					}
+					current.ReasoningContent = &KiroReasoningContent{RedactedContent: data}
 				}
 			case "tool_use":
 				toolUseID := part.Get("id").String()
@@ -638,7 +663,7 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 					inputMap, _ = kirocommon.DecodeToolInput(toolInput.Raw)
 				}
 
-				toolUses = append(toolUses, KiroToolUse{
+				current.ToolUses = append(current.ToolUses, KiroToolUse{
 					ToolUseID: toolUseID,
 					Name:      toolName,
 					Input:     inputMap,
@@ -649,25 +674,6 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 		contentBuilder.WriteString(content.String())
 	}
 
-	// Kiro's AssistantResponseMessage requires the content field, but the official
-	// client sends an empty string when a turn contains only tool uses. Inventing
-	// visible filler here pollutes the conversation and can be echoed by the model.
-	finalContent := contentBuilder.String()
-	var reasoningContent *KiroReasoningContent
-	if redactedContent != "" {
-		reasoningContent = &KiroReasoningContent{RedactedContent: redactedContent}
-	} else if reasoningText.Len() > 0 && reasoningSignature != "" {
-		reasoningContent = &KiroReasoningContent{
-			ReasoningText: &KiroReasoningText{
-				Text:      reasoningText.String(),
-				Signature: reasoningSignature,
-			},
-		}
-	}
-
-	return KiroAssistantResponseMessage{
-		Content:          finalContent,
-		ToolUses:         toolUses,
-		ReasoningContent: reasoningContent,
-	}
+	flush()
+	return messages
 }

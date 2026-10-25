@@ -152,11 +152,13 @@ func appendCountJSON(segments *[]string, value gjson.Result) {
 // So the total is Kiro's, the output is counted locally and the input is the
 // total minus the output. The request is never counted to make up an input.
 // Counters Kiro does send take precedence over all of this.
-func completeKiroUsage(detail usage.Detail, contextPercentage float64, contextWindow int64, content string, reasoning *kiroclaude.KiroReasoningContent, toolUses []kiroclaude.KiroToolUse) usage.Detail {
-	output := make([]string, 0, len(toolUses)*2+2)
+func completeKiroUsage(detail usage.Detail, contextPercentage float64, contextWindow int64, content string, reasoning []kiroclaude.KiroReasoningContent, toolUses []kiroclaude.KiroToolUse) usage.Detail {
+	output := make([]string, 0, len(toolUses)*2+len(reasoning)+1)
 	appendCountString(&output, content)
-	if reasoning != nil && reasoning.ReasoningText != nil {
-		appendCountString(&output, reasoning.ReasoningText.Text)
+	for _, block := range reasoning {
+		if block.ReasoningText != nil {
+			appendCountString(&output, block.ReasoningText.Text)
+		}
 	}
 	for _, toolUse := range toolUses {
 		appendCountString(&output, toolUse.Name)

@@ -851,13 +851,6 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
-			if attempt == 0 && isThinkingSignatureInvalid(respBody) {
-				if stripped, ok := stripInvalidReasoningHistory(body); ok {
-					body = stripped
-					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, endpoint.Origin, from, opts.Metadata)
-					continue
-				}
-			}
 			return resp, statusErr{code: http.StatusBadRequest, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 		}
 
@@ -1108,14 +1101,6 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 
 			log.Warnf("kiro: received 400 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 
-			if attempt == 0 && isThinkingSignatureInvalid(respBody) {
-				if stripped, ok := stripInvalidReasoningHistory(body); ok {
-					body = stripped
-					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, endpoint.Origin, from, opts.Metadata)
-					continue
-				}
-			}
-			// Other 400 errors indicate request validation issues.
 			return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 		}
 
@@ -1325,11 +1310,10 @@ type eventStreamMessage struct {
 // stop_reason from the response.
 // Buffers official toolUseEvent fragments without altering their input.
 // Returns: content, reasoning, toolUses, usageInfo, contextUsagePercentage, stopReason, error
-func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.KiroReasoningContent, []kiroclaude.KiroToolUse, usage.Detail, float64, string, error) {
+func (e *KiroExecutor) parseEventStream(body io.Reader) (string, []kiroclaude.KiroReasoningContent, []kiroclaude.KiroToolUse, usage.Detail, float64, string, error) {
 	var content strings.Builder
+	var reasoning []kiroclaude.KiroReasoningContent
 	var reasoningText strings.Builder
-	var reasoningSignature string
-	var redactedReasoning string
 	var toolUses []kiroclaude.KiroToolUse
 	var usageInfo usage.Detail
 	var stopReason string // Extracted from upstream response
@@ -1496,14 +1480,18 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 			if nested, ok := event["reasoningContentEvent"].(map[string]interface{}); ok {
 				reasoningEvent = nested
 			}
-			if text, ok := reasoningEvent["text"].(string); ok {
-				reasoningText.WriteString(text)
-			}
-			if signature, ok := reasoningEvent["signature"].(string); ok && signature != "" {
-				reasoningSignature = signature
-			}
-			if redacted, ok := reasoningEvent["redactedContent"].(string); ok && redacted != "" {
-				redactedReasoning = redacted
+			text, _ := reasoningEvent["text"].(string)
+			signature, _ := reasoningEvent["signature"].(string)
+			redacted, _ := reasoningEvent["redactedContent"].(string)
+			reasoningText.WriteString(text)
+			if redacted != "" {
+				reasoning = append(reasoning, kiroclaude.KiroReasoningContent{RedactedContent: redacted})
+				reasoningText.Reset()
+			} else if signature != "" {
+				reasoning = append(reasoning, kiroclaude.KiroReasoningContent{
+					ReasoningText: &kiroclaude.KiroReasoningText{Text: reasoningText.String(), Signature: signature},
+				})
+				reasoningText.Reset()
 			}
 
 		case "supplementaryWebLinksEvent":
@@ -1811,16 +1799,10 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 		log.Warnf("kiro: response truncated due to max_tokens limit")
 	}
 
-	var reasoning *kiroclaude.KiroReasoningContent
-	if redactedReasoning != "" {
-		reasoning = &kiroclaude.KiroReasoningContent{RedactedContent: redactedReasoning}
-	} else if reasoningText.Len() > 0 {
-		reasoning = &kiroclaude.KiroReasoningContent{
-			ReasoningText: &kiroclaude.KiroReasoningText{
-				Text:      reasoningText.String(),
-				Signature: reasoningSignature,
-			},
-		}
+	if reasoningText.Len() > 0 {
+		reasoning = append(reasoning, kiroclaude.KiroReasoningContent{
+			ReasoningText: &kiroclaude.KiroReasoningText{Text: reasoningText.String()},
+		})
 	}
 
 	return cleanedContent, reasoning, toolUses, usageInfo, upstreamContextPercentage, stopReason, nil
@@ -2590,6 +2572,13 @@ func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.R
 						out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
 					}
 				}
+				blockStop := kiroclaude.BuildClaudeThinkingBlockStopEvent(thinkingBlockIndex)
+				for _, chunk := range sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam) {
+					if len(chunk) > 0 {
+						out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
+					}
+				}
+				isThinkingBlockOpen = false
 			}
 
 		case "toolUseEvent":

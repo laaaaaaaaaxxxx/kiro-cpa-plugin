@@ -12,7 +12,7 @@ func TestBuildClaudeResponsePreservesSignedReasoningBeforeVisibleContent(t *test
 
 	response := BuildClaudeResponse(
 		"Answer",
-		&KiroReasoningContent{ReasoningText: &KiroReasoningText{Text: "internal reasoning", Signature: "signed-by-upstream"}},
+		[]KiroReasoningContent{{ReasoningText: &KiroReasoningText{Text: "internal reasoning", Signature: "signed-by-upstream"}}},
 		nil,
 		"claude-opus-5",
 		usage.Detail{InputTokens: 10, OutputTokens: 5},
@@ -27,5 +27,24 @@ func TestBuildClaudeResponsePreservesSignedReasoningBeforeVisibleContent(t *test
 	}
 	if blocks[1].Get("type").String() != "text" || blocks[1].Get("text").String() != "Answer" {
 		t.Fatalf("text block = %s", blocks[1].Raw)
+	}
+}
+
+func TestBuildClaudeResponsePreservesSignatureOnlyReasoning(t *testing.T) {
+	t.Parallel()
+	response := BuildClaudeResponse(
+		"Answer",
+		[]KiroReasoningContent{{ReasoningText: &KiroReasoningText{Signature: "signature-only"}}},
+		nil,
+		"claude-opus-5.5",
+		usage.Detail{},
+		"end_turn",
+	)
+	blocks := gjson.GetBytes(response, "content").Array()
+	if len(blocks) != 2 {
+		t.Fatalf("content blocks = %d; response=%s", len(blocks), response)
+	}
+	if blocks[0].Get("type").String() != "thinking" || !blocks[0].Get("thinking").Exists() || blocks[0].Get("thinking").String() != "" || blocks[0].Get("signature").String() != "signature-only" {
+		t.Fatalf("signature-only thinking was not preserved: %s", blocks[0].Raw)
 	}
 }

@@ -2,6 +2,7 @@ package modelcapabilities
 
 import (
 	"encoding/json"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +25,8 @@ type Capability struct {
 	SupportsMaxTokens   bool       `json:"supports_max_tokens,omitempty"`
 	MinimumOutputTokens int64      `json:"minimum_output_tokens,omitempty"`
 	MaximumOutputTokens int64      `json:"maximum_output_tokens,omitempty"`
+	ThinkingTypes       []string   `json:"thinking_types,omitempty"`
+	ThinkingDisplays    []string   `json:"thinking_displays,omitempty"`
 	// SchemaObserved records that a request-fields schema was actually read for
 	// this model. It does not gate what is forwarded — Kiro treats "no schema"
 	// and "a schema that declares no max_tokens" identically — but the capability
@@ -191,6 +194,24 @@ func (c Capability) AdditionalFieldsForRequest(effort string, maxTokens int64) m
 	return fields
 }
 
+func (c Capability) ThinkingFields(thinkingType, display string) (map[string]any, string) {
+	if display == "" {
+		return nil, ""
+	}
+	if !slices.Contains(c.ThinkingTypes, thinkingType) {
+		return nil, "thinking display dropped: model does not declare thinking type " + strconv.Quote(thinkingType)
+	}
+	note := ""
+	if display == "updates" && !slices.Contains(c.ThinkingDisplays, display) && slices.Contains(c.ThinkingDisplays, "summarized") {
+		display = "summarized"
+		note = "thinking display updates mapped to summarized; reasoning and progress updates are both returned"
+	}
+	if !slices.Contains(c.ThinkingDisplays, display) {
+		return nil, "thinking display " + strconv.Quote(display) + " dropped: model does not declare it"
+	}
+	return map[string]any{"type": thinkingType, "display": display}, note
+}
+
 func Parse(modelID string, schema json.RawMessage) Capability {
 	capability := Capability{ModelID: strings.TrimSpace(modelID)}
 	if len(schema) == 0 || string(schema) == "null" {
@@ -224,6 +245,12 @@ func Parse(modelID string, schema json.RawMessage) Capability {
 		capability.SupportsMaxTokens = true
 		capability.MinimumOutputTokens = integerValue(maxTokens["minimum"])
 		capability.MaximumOutputTokens = integerValue(maxTokens["maximum"])
+	}
+	if thinkingType, ok := nestedObject(root, "properties", "thinking", "properties", "type"); ok {
+		capability.ThinkingTypes = stringSlice(thinkingType["enum"])
+	}
+	if display, ok := nestedObject(root, "properties", "thinking", "properties", "display"); ok {
+		capability.ThinkingDisplays = stringSlice(display["enum"])
 	}
 	return capability
 }
@@ -326,6 +353,8 @@ func Snapshot() []Capability {
 				continue
 			}
 			current.EffortLevels = intersectLevels(current.EffortLevels, next.EffortLevels)
+			current.ThinkingTypes = intersectLevels(current.ThinkingTypes, next.ThinkingTypes)
+			current.ThinkingDisplays = intersectLevels(current.ThinkingDisplays, next.ThinkingDisplays)
 			if current.EffortPath != next.EffortPath || len(current.EffortLevels) == 0 {
 				current.EffortPath = EffortPathNone
 				current.EffortLevels = nil

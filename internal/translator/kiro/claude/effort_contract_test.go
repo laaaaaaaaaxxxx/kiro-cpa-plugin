@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -24,6 +25,27 @@ func TestBuildKiroPayloadUsesClaudeEffortContract(t *testing.T) {
 	}
 	if strings.Contains(gjson.GetBytes(payload, "systemPrompt").String(), "<thinking_mode>") {
 		t.Fatalf("system prompt contains a legacy control tag: %s", payload)
+	}
+}
+
+func TestBuildKiroPayloadForwardsThinkingDisplayWithoutChangingEffort(t *testing.T) {
+	capability := modelcapabilities.Parse("claude-opus-5.5", json.RawMessage(`{"properties":{"output_config":{"properties":{"effort":{"enum":["low","medium","high","xhigh","max"]}}},"thinking":{"properties":{"type":{"enum":["adaptive"]},"display":{"enum":["summarized","omitted"]}}},"max_tokens":{"minimum":1024,"maximum":128000}}}`))
+	for _, tc := range []struct{ display, want string }{
+		{"updates", "summarized"},
+		{"summarized", "summarized"},
+		{"omitted", "omitted"},
+	} {
+		t.Run(tc.display, func(t *testing.T) {
+			body := []byte(`{"messages":[{"role":"user","content":"Reply briefly"}],"thinking":{"type":"adaptive","display":"` + tc.display + `"},"max_tokens":128000}`)
+			payload, thinking := BuildKiroPayload(body, capability.ModelID, "profile", "AI_EDITOR", capability, "xhigh")
+			fields := gjson.GetBytes(payload, "additionalModelRequestFields")
+			if !thinking || fields.Get("output_config.effort").String() != "xhigh" || fields.Get("max_tokens").Int() != 128000 {
+				t.Fatalf("thinking/effort/budget changed: %s", fields.Raw)
+			}
+			if fields.Get("thinking.type").String() != "adaptive" || fields.Get("thinking.display").String() != tc.want {
+				t.Fatalf("thinking fields = %s", fields.Get("thinking").Raw)
+			}
+		})
 	}
 }
 

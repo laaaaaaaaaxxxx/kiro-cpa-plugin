@@ -12,23 +12,23 @@ import (
 
 // BuildClaudeResponse preserves text, reasoning, and tool
 // arguments returned by Kiro. It never manufactures reasoning metadata.
-func BuildClaudeResponse(content string, reasoning *KiroReasoningContent, toolUses []KiroToolUse, model string, usageInfo usage.Detail, stopReason string) []byte {
-	contentBlocks := make([]map[string]interface{}, 0, len(toolUses)+2)
-	if reasoning != nil {
-		if reasoning.RedactedContent != "" {
+func BuildClaudeResponse(content string, reasoning []KiroReasoningContent, toolUses []KiroToolUse, model string, usageInfo usage.Detail, stopReason string) []byte {
+	contentBlocks := make([]map[string]interface{}, 0, len(reasoning)+len(toolUses)+1)
+	for _, block := range reasoning {
+		if block.RedactedContent != "" {
 			contentBlocks = append(contentBlocks, map[string]interface{}{
 				"type": "redacted_thinking",
-				"data": reasoning.RedactedContent,
+				"data": block.RedactedContent,
 			})
-		} else if reasoning.ReasoningText != nil && reasoning.ReasoningText.Text != "" {
-			block := map[string]interface{}{
+		} else if block.ReasoningText != nil && (block.ReasoningText.Text != "" || block.ReasoningText.Signature != "") {
+			thinking := map[string]interface{}{
 				"type":     "thinking",
-				"thinking": reasoning.ReasoningText.Text,
+				"thinking": block.ReasoningText.Text,
 			}
-			if reasoning.ReasoningText.Signature != "" {
-				block["signature"] = reasoning.ReasoningText.Signature
+			if block.ReasoningText.Signature != "" {
+				thinking["signature"] = block.ReasoningText.Signature
 			}
-			contentBlocks = append(contentBlocks, block)
+			contentBlocks = append(contentBlocks, thinking)
 		}
 	}
 	if content != "" {

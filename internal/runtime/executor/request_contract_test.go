@@ -1,10 +1,14 @@
 package executor
 
 import (
+	"io"
+	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -312,6 +316,89 @@ func TestBillingHeaderStrippedThroughExecutorWithoutInlineSystemPR(t *testing.T)
 			if strings.Contains(content, "x-anthropic-billing-header") || !strings.Contains(content, "base") || (inline != "" && !strings.Contains(content, "later")) {
 				t.Errorf("system %s, inline=%q yielded %q", system, inline, content)
 			}
+		}
+	}
+}
+
+func TestThinkingHistoryForwardsMultipleBlocksWithoutLoss(t *testing.T) {
+	for _, test := range []struct {
+		name, assistants, want string
+	}{
+		{"two-signed", `{"role":"assistant","content":[{"type":"thinking","thinking":"first","signature":"one"},{"type":"thinking","thinking":"second","signature":"two"}]}`, `[{"reasoningText":{"text":"first","signature":"one"}},{"reasoningText":{"text":"second","signature":"two"}}]`},
+		{"signed-redacted", `{"role":"assistant","content":[{"type":"thinking","thinking":"first","signature":"one"},{"type":"redacted_thinking","data":"opaque"}]}`, `[{"reasoningText":{"text":"first","signature":"one"}},{"redactedContent":"opaque"}]`},
+		{"two-redacted", `{"role":"assistant","content":[{"type":"redacted_thinking","data":"first"},{"type":"redacted_thinking","data":"second"}]}`, `[{"redactedContent":"first"},{"redactedContent":"second"}]`},
+		{"adjacent-signed", `{"role":"assistant","content":[{"type":"thinking","thinking":"first","signature":"one"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"second","signature":"two"}]}`, `[{"reasoningText":{"text":"first","signature":"one"}},{"reasoningText":{"text":"second","signature":"two"}}]`},
+	} {
+		for _, stream := range []bool{false, true} {
+			name := test.name + "/buffered"
+			if stream {
+				name = test.name + "/stream"
+			}
+			t.Run(name, func(t *testing.T) {
+				requests := 0
+				var sent []byte
+				stubUpstream(t, func(request *http.Request) (*http.Response, error) {
+					requests++
+					var err error
+					sent, err = io.ReadAll(request.Body)
+					if err != nil {
+						return nil, err
+					}
+					return upstreamStatus(http.StatusOK, nil, string(kiroEventStream(kiroEvent("assistantResponseEvent", `{"content":"Answer"}`)))), nil
+				})
+				body := []byte(`{"messages":[{"role":"user","content":"Think"},` + test.assistants + `,{"role":"user","content":"Continue"}]}`)
+				original := string(body)
+				request := cliproxyexecutor.Request{Model: "claude-haiku-4.5", Payload: body, Format: sdktranslator.FormatClaude}
+				options := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, OriginalRequest: body}
+				executor := NewKiroExecutor(nil)
+				auth := builderIDAuth("thinking-shape-" + name)
+				var err error
+				if stream {
+					result, streamErr := executor.ExecuteStream(t.Context(), auth, request, options)
+					err = streamErr
+					if err == nil {
+						for chunk := range result.Chunks {
+							if chunk.Err != nil {
+								t.Fatal(chunk.Err)
+							}
+						}
+					}
+				} else {
+					_, err = executor.Execute(t.Context(), auth, request, options)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if requests != 1 {
+					t.Fatalf("upstream requests = %d, want 1", requests)
+				}
+				var got []any
+				for _, message := range gjson.GetBytes(sent, "conversationState.history").Array() {
+					if reasoning := message.Get("assistantResponseMessage.reasoningContent"); reasoning.Exists() {
+						got = append(got, reasoning.Value())
+					}
+				}
+				if !reflect.DeepEqual(got, gjson.Parse(test.want).Value()) {
+					t.Fatalf("outbound reasoning = %#v, want %s", got, test.want)
+				}
+				if string(body) != original {
+					t.Fatal("caller history was mutated")
+				}
+			})
+		}
+	}
+}
+
+func TestThinkingHistoryAcceptsSingleBlocks(t *testing.T) {
+	t.Parallel()
+	for _, block := range []string{
+		`{"type":"thinking","thinking":"reasoning\n\n","signature":"one"}`,
+		`{"type":"thinking","thinking":"","signature":"one"}`,
+		`{"type":"redacted_thinking","data":"opaque"}`,
+	} {
+		body := []byte(`{"messages":[{"role":"user","content":"Think"},{"role":"assistant","content":[` + block + `,{"type":"text","text":"Answer"}]},{"role":"user","content":"Continue"}]}`)
+		if err := validateKiroRequest(body, body, sdktranslator.FormatClaude); err != nil {
+			t.Fatalf("single block rejected: %v; block=%s", err, block)
 		}
 	}
 }

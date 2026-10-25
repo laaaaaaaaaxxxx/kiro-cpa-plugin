@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,50 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func TestBufferedThinkingPreservesOrderedSignedAndRedactedBlocks(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		events []string
+		want   string
+	}{
+		{name: "signed-empty", events: []string{`{"signature":"one"}`}, want: `[{"type":"thinking","thinking":"","signature":"one"}]`},
+		{name: "signed-whitespace", events: []string{`{"text":"  reasoning\n\n"}`, `{"signature":"one"}`}, want: `[{"type":"thinking","thinking":"  reasoning\n\n","signature":"one"}]`},
+		{name: "redacted", events: []string{`{"redactedContent":"opaque"}`}, want: `[{"type":"redacted_thinking","data":"opaque"}]`},
+		{name: "two-signed", events: []string{`{"text":"first"}`, `{"signature":"one"}`, `{"text":"second"}`, `{"signature":"two"}`}, want: `[{"type":"thinking","thinking":"first","signature":"one"},{"type":"thinking","thinking":"second","signature":"two"}]`},
+		{name: "signed-redacted", events: []string{`{"text":"first"}`, `{"signature":"one"}`, `{"redactedContent":"opaque"}`}, want: `[{"type":"thinking","thinking":"first","signature":"one"},{"type":"redacted_thinking","data":"opaque"}]`},
+		{name: "redacted-signed", events: []string{`{"redactedContent":"opaque"}`, `{"signature":"one"}`}, want: `[{"type":"redacted_thinking","data":"opaque"},{"type":"thinking","thinking":"","signature":"one"}]`},
+		{name: "two-redacted", events: []string{`{"redactedContent":"first"}`, `{"redactedContent":"second"}`}, want: `[{"type":"redacted_thinking","data":"first"},{"type":"redacted_thinking","data":"second"}]`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			frames := make([][]byte, 0, len(test.events)+2)
+			for _, event := range test.events {
+				frames = append(frames, kiroEvent("reasoningContentEvent", event))
+			}
+			frames = append(frames, kiroEvent("assistantResponseEvent", `{"content":"Answer"}`))
+			frames = append(frames, kiroEvent("toolUseEvent", `{"toolUseId":"call_1","name":"Read","input":{"path":"README.md"},"stop":true}`))
+			content, reasoning, tools, usageInfo, _, stopReason, err := (&KiroExecutor{}).parseEventStream(bytes.NewReader(kiroEventStream(frames...)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := kiroclaude.BuildClaudeResponse(content, reasoning, tools, "claude-opus-5.5", usageInfo, stopReason)
+			blocks := gjson.GetBytes(response, "content").Array()
+			want := gjson.Parse(test.want).Array()
+			if len(blocks) != len(want)+2 {
+				t.Fatalf("content blocks = %d; response=%s", len(blocks), response)
+			}
+			for i, block := range want {
+				if !reflect.DeepEqual(blocks[i].Value(), block.Value()) {
+					t.Fatalf("reasoning block %d = %s, want %s", i, blocks[i].Raw, block.Raw)
+				}
+			}
+			if blocks[len(want)].Get("text").String() != "Answer" || blocks[len(want)+1].Get("id").String() != "call_1" || blocks[len(want)+1].Get("input.path").String() != "README.md" {
+				t.Fatalf("visible content or tool call changed: %s", response)
+			}
+		})
+	}
+}
 
 func TestParseEventStreamAccumulatesFragmentedSignedReasoning(t *testing.T) {
 	t.Parallel()
@@ -36,11 +81,11 @@ func TestParseEventStreamAccumulatesFragmentedSignedReasoning(t *testing.T) {
 	if len(toolUses) != 0 {
 		t.Fatalf("tool uses = %d, want 0", len(toolUses))
 	}
-	if reasoning == nil || reasoning.ReasoningText == nil {
+	if len(reasoning) != 1 || reasoning[0].ReasoningText == nil {
 		t.Fatalf("reasoning = %#v", reasoning)
 	}
-	if reasoning.ReasoningText.Text != "Vou pensar." || reasoning.ReasoningText.Signature != "signed-by-upstream" {
-		t.Fatalf("reasoning text = %#v", reasoning.ReasoningText)
+	if reasoning[0].ReasoningText.Text != "Vou pensar." || reasoning[0].ReasoningText.Signature != "signed-by-upstream" {
+		t.Fatalf("reasoning text = %#v", reasoning[0].ReasoningText)
 	}
 }
 
@@ -63,6 +108,7 @@ func TestStreamKeepsSignedReasoningOutOfVisibleText(t *testing.T) {
 	var visibleText strings.Builder
 	var thinkingText strings.Builder
 	var signature string
+	thinkingDeltas := 0
 	for chunk := range out {
 		if chunk.Err != nil {
 			t.Fatal(chunk.Err)
@@ -77,6 +123,7 @@ func TestStreamKeepsSignedReasoningOutOfVisibleText(t *testing.T) {
 		case "text_delta":
 			visibleText.WriteString(data.Get("delta.text").String())
 		case "thinking_delta":
+			thinkingDeltas++
 			thinkingText.WriteString(data.Get("delta.thinking").String())
 		case "signature_delta":
 			signature = data.Get("delta.signature").String()
@@ -88,6 +135,9 @@ func TestStreamKeepsSignedReasoningOutOfVisibleText(t *testing.T) {
 	}
 	if thinkingText.String() != "Vou pensar." || signature != "signed-by-upstream" {
 		t.Fatalf("thinking = %q signature = %q; delta types=%v", thinkingText.String(), signature, deltaTypes)
+	}
+	if thinkingDeltas != 2 {
+		t.Fatalf("thinking deltas = %d, want the two upstream fragments", thinkingDeltas)
 	}
 	if strings.Index(strings.Join(deltaTypes, ","), "thinking_delta") > strings.Index(strings.Join(deltaTypes, ","), "signature_delta") {
 		t.Fatalf("signature preceded thinking: %v", deltaTypes)
@@ -155,6 +205,118 @@ func TestStreamDoesNotExposeUnsignedReasoning(t *testing.T) {
 	}
 	if visibleText.String() != "visible" {
 		t.Fatalf("visible text = %q", visibleText.String())
+	}
+}
+
+func TestStreamForwardsThinkingBeforeUpstreamSendsItsSignature(t *testing.T) {
+	t.Parallel()
+
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	forwarded := make(chan struct{})
+	go func() {
+		defer writer.Close()
+		if _, err := writer.Write(kiroEvent("reasoningContentEvent", `{"text":"first fragment"}`)); err != nil {
+			return
+		}
+		select {
+		case <-forwarded:
+		case <-ctx.Done():
+			return
+		}
+		_, _ = writer.Write(kiroEventStream(
+			kiroEvent("reasoningContentEvent", `{"signature":"opaque-signature"}`),
+			kiroEvent("assistantResponseEvent", `{"content":"answer"}`),
+		))
+	}()
+	out := make(chan cliproxyexecutor.StreamChunk, 16)
+	go func() {
+		defer close(out)
+		(&KiroExecutor{}).streamToChannel(ctx, reader, out, sdktranslator.FormatClaude, "claude-opus-5.5", nil, nil, 0)
+	}()
+	firstForwarded := false
+	signatureSeen := false
+	for {
+		select {
+		case chunk, ok := <-out:
+			if !ok {
+				if !firstForwarded || !signatureSeen {
+					t.Fatalf("thinking forwarded=%v signature seen=%v", firstForwarded, signatureSeen)
+				}
+				return
+			}
+			if chunk.Err != nil {
+				t.Fatal(chunk.Err)
+			}
+			data := eventData(chunk.Payload)
+			switch data.Get("delta.type").String() {
+			case "thinking_delta":
+				if data.Get("delta.thinking").String() != "first fragment" {
+					t.Fatalf("thinking = %s", data.Raw)
+				}
+				if !firstForwarded {
+					firstForwarded = true
+					close(forwarded)
+				}
+			case "signature_delta":
+				signatureSeen = data.Get("delta.signature").String() == "opaque-signature"
+			}
+		case <-ctx.Done():
+			t.Fatal("thinking was withheld while upstream waited to send its signature")
+		}
+	}
+}
+
+func TestStreamPreservesSeparateSignedAndRedactedThinkingBlocks(t *testing.T) {
+	t.Parallel()
+	body := kiroEventStream(
+		kiroEvent("reasoningContentEvent", `{"text":"one"}`),
+		kiroEvent("reasoningContentEvent", `{"signature":"signature-one"}`),
+		kiroEvent("reasoningContentEvent", `{"text":"two"}`),
+		kiroEvent("reasoningContentEvent", `{"signature":"signature-two"}`),
+		kiroEvent("reasoningContentEvent", `{"redactedContent":"opaque-redacted"}`),
+		kiroEvent("toolUseEvent", `{"toolUseEvent":{"toolUseId":"call_1","name":"read_file","input":{"path":"README.md"},"stop":true}}`),
+	)
+	out := make(chan cliproxyexecutor.StreamChunk, 32)
+	(&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5.5", nil, nil, 0)
+	close(out)
+	var signatures []string
+	var starts []string
+	open := int64(-1)
+	for chunk := range out {
+		if chunk.Err != nil {
+			t.Fatal(chunk.Err)
+		}
+		data := eventData(chunk.Payload)
+		switch data.Get("type").String() {
+		case "content_block_start":
+			if open >= 0 {
+				t.Fatal("new block started before the previous block stopped")
+			}
+			open = data.Get("index").Int()
+			starts = append(starts, data.Get("content_block.type").String())
+			if starts[len(starts)-1] == "redacted_thinking" && data.Get("content_block.data").String() != "opaque-redacted" {
+				t.Fatal("redacted content changed")
+			}
+		case "content_block_delta":
+			if data.Get("index").Int() != open {
+				t.Fatal("delta was attached to the wrong block")
+			}
+			if data.Get("delta.type").String() == "signature_delta" {
+				signatures = append(signatures, data.Get("delta.signature").String())
+			}
+		case "content_block_stop":
+			if data.Get("index").Int() != open {
+				t.Fatal("stop was attached to the wrong block")
+			}
+			open = -1
+		}
+	}
+	if strings.Join(starts, ",") != "thinking,thinking,redacted_thinking,tool_use" || strings.Join(signatures, ",") != "signature-one,signature-two" || open != -1 {
+		t.Fatalf("starts=%v signatures=%v open=%d", starts, signatures, open)
 	}
 }
 
