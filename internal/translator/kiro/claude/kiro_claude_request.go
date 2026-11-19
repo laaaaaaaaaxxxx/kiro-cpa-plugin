@@ -245,10 +245,12 @@ func normalizeUnknownToolHistory(history []KiroHistoryMessage, current *KiroUser
 	}
 	// A tool result answers the assistant turn just before it, so the ids
 	// flattened in one assistant turn are flattened in the next user turn.
+	// guard: ids reset only after a user turn; the Claude translator's
+	// BuildAssistantMessages splits one turn into consecutive assistant entries,
+	// one per signed thinking block.
 	var flattened map[string]struct{}
 	for i := range history {
 		if assistant := history[i].AssistantResponseMessage; assistant != nil {
-			flattened = nil
 			var kept, unknown []KiroToolUse
 			for _, toolUse := range assistant.ToolUses {
 				if _, ok := toolNames[toolUse.Name]; ok {
@@ -318,11 +320,14 @@ func appendHistoryText(content, extra string) string {
 	return content + "\n\n" + extra
 }
 
+// source: https://linear.app/stillx/issue/STI-968 tool calls replayed as
+// <tool_use> text were imitated instead of invoked, so they are labelled as
+// not executable.
 func formatToolUses(toolUses []KiroToolUse) string {
 	parts := make([]string, 0, len(toolUses))
 	for _, toolUse := range toolUses {
-		input, _ := json.Marshal(toolUse.Input)
-		parts = append(parts, fmt.Sprintf("<tool_use id=%q name=%q>\n%s\n</tool_use>", toolUse.ToolUseID, toolUse.Name, input))
+		encoded, _ := json.Marshal(toolUse)
+		parts = append(parts, fmt.Sprintf("Historical unavailable tool call (not an executable call): %s", encoded))
 	}
 	return strings.Join(parts, "\n\n")
 }
@@ -330,11 +335,8 @@ func formatToolUses(toolUses []KiroToolUse) string {
 func formatToolResults(results []KiroToolResult) string {
 	parts := make([]string, 0, len(results))
 	for _, result := range results {
-		texts := make([]string, 0, len(result.Content))
-		for _, content := range result.Content {
-			texts = append(texts, content.Text)
-		}
-		parts = append(parts, fmt.Sprintf("<tool_result id=%q status=%q>\n%s\n</tool_result>", result.ToolUseID, result.Status, strings.Join(texts, "\n")))
+		encoded, _ := json.Marshal(result)
+		parts = append(parts, fmt.Sprintf("Historical unavailable tool result: %s", encoded))
 	}
 	return strings.Join(parts, "\n\n")
 }

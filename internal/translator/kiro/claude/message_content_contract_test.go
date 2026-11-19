@@ -49,15 +49,76 @@ func TestBuildKiroPayloadFlattensUndeclaredHistoricalTool(t *testing.T) {
 		t.Fatal(err)
 	}
 	assistant := payload.ConversationState.History[1].AssistantResponseMessage
-	if len(assistant.ToolUses) != 0 || !strings.Contains(assistant.Content, `<tool_use id="call_old" name="OldTool">`) {
+	if len(assistant.ToolUses) != 0 || !strings.Contains(assistant.Content, `Historical unavailable tool call (not an executable call):`) || !strings.Contains(assistant.Content, `"toolUseId":"call_old"`) {
 		t.Fatalf("undeclared tool use was not flattened: %#v", assistant)
 	}
 	current := payload.ConversationState.CurrentMessage.UserInputMessage
 	if current.UserInputMessageContext == nil || len(current.UserInputMessageContext.ToolResults) != 0 {
 		t.Fatalf("structured tool results were retained: %#v", current.UserInputMessageContext)
 	}
-	if !strings.Contains(current.Content, `<tool_result id="call_old" status="success">`) {
+	if !strings.Contains(current.Content, `Historical unavailable tool result:`) || !strings.Contains(current.Content, `"toolUseId":"call_old"`) {
 		t.Fatalf("tool result text was not preserved: %q", current.Content)
+	}
+}
+
+func TestBuildKiroPayloadKeepsDeclaredToolsWithUnknownHistory(t *testing.T) {
+	for _, historicalResults := range []bool{false, true} {
+		t.Run(map[bool]string{false: "current_mixed_results", true: "historical_mixed_results"}[historicalResults], func(t *testing.T) {
+			suffix := ""
+			if historicalResults {
+				suffix = `,
+				{"role":"assistant","content":[{"type":"text","text":"  keep these bytes\n"},{"type":"tool_use","id":"call_next","name":"Bash","input":{"command":"kubectl version --client"}}]},
+				{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_next","content":"next result"}]}`
+			}
+			body := []byte(`{
+				"messages":[
+					{"role":"user","content":"Inspect the cluster."},
+					{"role":"assistant","content":[
+						{"type":"thinking","thinking":"reasoning bytes","signature":"upstream signature"},
+						{"type":"tool_use","id":"call_known","name":"Bash","input":{"command":"kubectl get pods"}},
+						{"type":"tool_use","id":"call_unknown","name":"Grep","input":{"pattern":"cliproxy"}}
+					]},
+					{"role":"user","content":[
+						{"type":"tool_result","tool_use_id":"call_known","content":"known result"},
+						{"type":"tool_result","tool_use_id":"call_unknown","is_error":true,"content":"No such tool available: Grep"}
+					]}` + suffix + `
+				],
+				"tools":[{"name":"Bash","description":"Run a command","input_schema":{"type":"object"}}]
+			}`)
+			raw, _ := BuildKiroPayload(body, "claude-opus-5.5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "xhigh")
+			var payload KiroPayload
+			if err := json.Unmarshal(raw, &payload); err != nil {
+				t.Fatal(err)
+			}
+			history := payload.ConversationState.History
+			assistant := history[1].AssistantResponseMessage
+			if len(assistant.ToolUses) != 1 || assistant.ToolUses[0].ToolUseID != "call_known" || assistant.ToolUses[0].Input["command"] != "kubectl get pods" {
+				t.Fatalf("declared call changed: %#v", assistant.ToolUses)
+			}
+			if assistant.ReasoningContent.ReasoningText.Text != "reasoning bytes" || assistant.ReasoningContent.ReasoningText.Signature != "upstream signature" {
+				t.Fatalf("reasoning changed: %#v", assistant.ReasoningContent)
+			}
+			current := payload.ConversationState.CurrentMessage.UserInputMessage
+			mixed := current
+			if historicalResults {
+				mixed = *history[2].UserInputMessage
+				if history[3].AssistantResponseMessage.Content != "  keep these bytes\n" {
+					t.Fatalf("unaffected assistant text changed: %q", history[3].AssistantResponseMessage.Content)
+				}
+				if len(current.UserInputMessageContext.ToolResults) != 1 || current.UserInputMessageContext.ToolResults[0].ToolUseID != "call_next" || current.Content != "" {
+					t.Fatalf("current results changed: %#v", current)
+				}
+			}
+			if len(mixed.UserInputMessageContext.ToolResults) != 1 || mixed.UserInputMessageContext.ToolResults[0].ToolUseID != "call_known" || mixed.UserInputMessageContext.ToolResults[0].Content[0].Text != "known result" {
+				t.Fatalf("declared result changed: %#v", mixed)
+			}
+			if !strings.Contains(mixed.Content, `"toolUseId":"call_unknown"`) || !strings.Contains(mixed.Content, `"status":"error"`) || !strings.Contains(mixed.Content, "No such tool available: Grep") {
+				t.Fatalf("unknown result lost: %q", mixed.Content)
+			}
+			if strings.Contains(assistant.Content+mixed.Content, "<tool_use") || strings.Contains(assistant.Content+mixed.Content, "<tool_result") || strings.Contains(assistant.Content, `"name":"Bash"`) {
+				t.Fatalf("tool protocol leaked into text: %q %q", assistant.Content, mixed.Content)
+			}
+		})
 	}
 }
 
@@ -213,16 +274,16 @@ func TestBuildKiroPayloadFlattensOnlyUndeclaredToolPairs(t *testing.T) {
 	if got := toolResultIDs(h[2].UserInputMessage); got != "a" {
 		t.Errorf("history[2] tool results = %q, want a", got)
 	}
-	if got := toolUseIDs(h[3].AssistantResponseMessage); got != "" || !strings.Contains(h[3].AssistantResponseMessage.Content, `<tool_use id="b" name="mcp__gone__tool">`) {
+	if got := toolUseIDs(h[3].AssistantResponseMessage); got != "" || !strings.Contains(h[3].AssistantResponseMessage.Content, `Historical unavailable tool call (not an executable call): {"toolUseId":"b","name":"mcp__gone__tool"`) {
 		t.Errorf("history[3] tool uses = %q content = %q, want b flattened", got, h[3].AssistantResponseMessage.Content)
 	}
-	if got := toolResultIDs(h[4].UserInputMessage); got != "" || !strings.Contains(h[4].UserInputMessage.Content, `<tool_result id="b" status="success">`) {
+	if got := toolResultIDs(h[4].UserInputMessage); got != "" || !strings.Contains(h[4].UserInputMessage.Content, `Historical unavailable tool result: {"content":[{"text":"gone-body"}],"status":"success","toolUseId":"b"}`) {
 		t.Errorf("history[4] tool results = %q content = %q, want b flattened", got, h[4].UserInputMessage.Content)
 	}
-	if got := toolUseIDs(h[5].AssistantResponseMessage); got != "c" || !strings.Contains(h[5].AssistantResponseMessage.Content, `<tool_use id="d"`) {
+	if got := toolUseIDs(h[5].AssistantResponseMessage); got != "c" || !strings.Contains(h[5].AssistantResponseMessage.Content, `"toolUseId":"d"`) {
 		t.Errorf("history[5] tool uses = %q content = %q, want c kept and d flattened", got, h[5].AssistantResponseMessage.Content)
 	}
-	if got := toolResultIDs(&current); got != "c" || !strings.Contains(current.Content, `<tool_result id="d"`) || strings.Contains(current.Content, `id="c"`) {
+	if got := toolResultIDs(&current); got != "c" || !strings.Contains(current.Content, `"toolUseId":"d"`) || strings.Contains(current.Content, `"toolUseId":"c"`) {
 		t.Errorf("current tool results = %q content = %q, want c kept and d flattened", got, current.Content)
 	}
 }
@@ -362,13 +423,43 @@ func TestUndeclaredToolPairsKeepBlankLineSeparators(t *testing.T) {
 	if len(assistant.ToolUses) != 0 {
 		t.Fatal("undeclared tools were not flattened")
 	}
-	wantUses := "<tool_use id=\"a\" name=\"GoneA\">\n{}\n</tool_use>\n\n<tool_use id=\"b\" name=\"GoneB\">\n{}\n</tool_use>"
+	wantUses := "Historical unavailable tool call (not an executable call): {\"toolUseId\":\"a\",\"name\":\"GoneA\",\"input\":{}}\n\nHistorical unavailable tool call (not an executable call): {\"toolUseId\":\"b\",\"name\":\"GoneB\",\"input\":{}}"
 	if assistant.Content != wantUses {
 		t.Errorf("flattened tool uses = %q, want %q", assistant.Content, wantUses)
 	}
 	current := payload.ConversationState.CurrentMessage.UserInputMessage
-	wantResults := "<tool_result id=\"a\" status=\"success\">\nfirst\n</tool_result>\n\n<tool_result id=\"b\" status=\"success\">\nsecond\n</tool_result>"
+	wantResults := "Historical unavailable tool result: {\"content\":[{\"text\":\"first\"}],\"status\":\"success\",\"toolUseId\":\"a\"}\n\nHistorical unavailable tool result: {\"content\":[{\"text\":\"second\"}],\"status\":\"success\",\"toolUseId\":\"b\"}"
 	if current.Content != wantResults {
 		t.Errorf("flattened tool results = %q, want %q", current.Content, wantResults)
+	}
+}
+
+func TestUndeclaredToolInSplitAssistantTurnFlattensItsResult(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+		"messages":[
+			{"role":"user","content":"go"},
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"one","signature":"s1"},
+				{"type":"tool_use","id":"call_gone","name":"GoneTool","input":{}},
+				{"type":"thinking","thinking":"two","signature":"s2"},
+				{"type":"tool_use","id":"call_read","name":"Read","input":{"path":"a"}}
+			]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"call_gone","content":"gone result"},
+				{"type":"tool_result","tool_use_id":"call_read","content":"read result"}
+			]}
+		],
+		"tools":[{"name":"Read","description":"Read","input_schema":{"type":"object"}}]
+	}`)
+	raw, _ := BuildKiroPayload(body, "claude-opus-5.5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
+	var payload KiroPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	current := payload.ConversationState.CurrentMessage.UserInputMessage
+	results := current.UserInputMessageContext.ToolResults
+	if len(results) != 1 || results[0].ToolUseID != "call_read" || !strings.Contains(current.Content, `"toolUseId":"call_gone"`) {
+		t.Fatalf("current tool results = %#v content = %q, want call_read kept and call_gone flattened", results, current.Content)
 	}
 }

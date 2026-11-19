@@ -224,7 +224,6 @@ func normalizeUnknownToolHistory(history []KiroHistoryMessage, current *KiroUser
 	var flattened map[string]struct{}
 	for i := range history {
 		if assistant := history[i].AssistantResponseMessage; assistant != nil {
-			flattened = nil
 			var kept, unknown []KiroToolUse
 			for _, toolUse := range assistant.ToolUses {
 				if _, ok := toolNames[toolUse.Name]; ok {
@@ -285,8 +284,8 @@ func splitFlattenedToolResults(results []KiroToolResult, flattened map[string]st
 func formatOpenAIToolUses(toolUses []KiroToolUse) string {
 	parts := make([]string, 0, len(toolUses))
 	for _, toolUse := range toolUses {
-		input, _ := json.Marshal(toolUse.Input)
-		parts = append(parts, fmt.Sprintf("<tool_use id=%q name=%q>\n%s\n</tool_use>", toolUse.ToolUseID, toolUse.Name, input))
+		encoded, _ := json.Marshal(toolUse)
+		parts = append(parts, fmt.Sprintf("Historical unavailable tool call (not an executable call): %s", encoded))
 	}
 	return strings.Join(parts, "\n\n")
 }
@@ -294,11 +293,8 @@ func formatOpenAIToolUses(toolUses []KiroToolUse) string {
 func formatOpenAIToolResults(results []KiroToolResult) string {
 	parts := make([]string, 0, len(results))
 	for _, result := range results {
-		texts := make([]string, 0, len(result.Content))
-		for _, content := range result.Content {
-			texts = append(texts, content.Text)
-		}
-		parts = append(parts, fmt.Sprintf("<tool_result id=%q status=%q>\n%s\n</tool_result>", result.ToolUseID, result.Status, strings.Join(texts, "\n")))
+		encoded, _ := json.Marshal(result)
+		parts = append(parts, fmt.Sprintf("Historical unavailable tool result: %s", encoded))
 	}
 	return strings.Join(parts, "\n\n")
 }
